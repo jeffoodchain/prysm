@@ -16,6 +16,10 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// maxFinalizedRootSearch is for bounding the number of iterations
+// when searching for a finalized canonical root below a given slot.
+const maxFinalizedRootSearch = 1024
+
 // MigrateToCold moves finalized states to cold storage and advances the migration cursor.
 func (s *State) MigrateToCold(ctx context.Context, fRoot [32]byte) error {
 	ctx, span := trace.StartSpan(ctx, "stateGen.MigrateToCold")
@@ -75,16 +79,10 @@ func (s *State) MigrateToCold(ctx context.Context, fRoot [32]byte) error {
 			aRoot = cached.root
 			aState = cached.state
 		} else {
-			_, roots, err := s.beaconDB.HighestRootsBelowSlot(ctx, slot)
+			aRoot, err = s.canonicalRootBelowSlot(ctx, slot)
 			if err != nil {
-				return err
+				return fmt.Errorf("canonical root below slot %d not found: %w", slot, err)
 			}
-			// Given the block has been finalized, the db should not have more than one block in a given slot.
-			// We should error out when this happens.
-			if len(roots) != 1 {
-				return errUnknownBlock
-			}
-			aRoot = roots[0]
 			// There's no need to generate the state if the state already exists in the DB.
 			// We can skip saving the state.
 			if !s.beaconDB.HasState(ctx, aRoot) {
@@ -168,16 +166,10 @@ func (s *State) migrateToColdHdiff(ctx context.Context, fRoot [32]byte) error {
 		} else {
 			// we check for slot+1 because we don't want to treat this slot as a missed block when it's not in cache.
 			// this specifically happens when the state is evicted from the caches in long non finalization.
-			_, roots, err := s.beaconDB.HighestRootsBelowSlot(ctx, slot+1)
+			aRoot, err = s.canonicalRootBelowSlot(ctx, slot+1)
 			if err != nil {
-				return err
+				return fmt.Errorf("canonical root below slot %d not found: %w", slot, err)
 			}
-			// Given the block has been finalized, the db should not have more than one block in a given slot.
-			// We should error out when this happens.
-			if len(roots) != 1 {
-				return errUnknownBlock
-			}
-			aRoot = roots[0]
 			// Different than the legacy MigrateToCold, we need to always get the state even if
 			// the state exists in DB as part of the hot state db, because we need to process slots
 			// to the state diff tree slots.
@@ -236,4 +228,24 @@ func (s *State) migrateHotToCold(aRoot [32]byte) {
 		}
 	}
 	s.saveHotStateDB.lock.Unlock()
+}
+
+// canonicalRootBelowSlot returns a finalized canonical block immediately before slot.
+func (s *State) canonicalRootBelowSlot(ctx context.Context, slot primitives.Slot) ([32]byte, error) {
+	for attempts := 0; slot > 0 && attempts < maxFinalizedRootSearch; attempts++ {
+		if err := ctx.Err(); err != nil {
+			return [32]byte{}, err
+		}
+		found, roots, err := s.beaconDB.HighestRootsBelowSlot(ctx, slot)
+		if err != nil {
+			return [32]byte{}, fmt.Errorf("highest roots below slot %d: %w", slot, err)
+		}
+		for _, root := range roots {
+			if s.beaconDB.IsFinalizedBlock(ctx, root) {
+				return root, nil
+			}
+		}
+		slot = found
+	}
+	return [32]byte{}, errUnknownBlock
 }

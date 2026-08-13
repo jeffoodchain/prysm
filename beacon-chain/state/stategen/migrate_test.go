@@ -10,8 +10,10 @@ import (
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/state"
 	"github.com/OffchainLabs/prysm/v7/cmd/beacon-chain/flags"
 	"github.com/OffchainLabs/prysm/v7/config/features"
+	"github.com/OffchainLabs/prysm/v7/config/params"
 	consensusblocks "github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
+	"github.com/OffchainLabs/prysm/v7/crypto/bls"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	"github.com/OffchainLabs/prysm/v7/testing/assert"
 	"github.com/OffchainLabs/prysm/v7/testing/require"
@@ -72,7 +74,7 @@ func TestMigrateToCold_HappyPath(t *testing.T) {
 	require.LogsContain(t, hook, "Saved state in DB")
 }
 
-func TestMigrateToCold_RegeneratePath(t *testing.T) {
+func TestMigrateToCold_RegeneratePath_IgnoresOrphan(t *testing.T) {
 	hook := logTest.NewGlobal()
 	ctx := t.Context()
 	beaconDB := testDB.SetupDB(t)
@@ -89,25 +91,40 @@ func TestMigrateToCold_RegeneratePath(t *testing.T) {
 	assert.NoError(t, beaconDB.SaveState(ctx, beaconState, gRoot))
 	assert.NoError(t, beaconDB.SaveGenesisBlockRoot(ctx, gRoot))
 
+	// Add an orphaned block at slot 1.
+	orphanConfig := util.DefaultBlockGenConfig()
+	orphanConfig.NumAttestations = 0
+	orphan, err := util.GenerateFullBlock(beaconState, pks, orphanConfig, 1)
+	require.NoError(t, err)
+	orphanRoot, err := orphan.Block.HashTreeRoot()
+	require.NoError(t, err)
+	util.SaveBlock(t, ctx, service.beaconDB, orphan)
+	require.NoError(t, service.beaconDB.SaveStateSummary(ctx, &ethpb.StateSummary{Slot: 1, Root: orphanRoot[:]}))
+
 	b1, err := util.GenerateFullBlock(beaconState, pks, util.DefaultBlockGenConfig(), 1)
+	require.NoError(t, err)
+	wB1, err := consensusblocks.NewSignedBeaconBlock(b1)
+	require.NoError(t, err)
+	state1, err := executeStateTransitionStateGen(ctx, beaconState.Copy(), wB1)
 	require.NoError(t, err)
 	r1, err := b1.Block.HashTreeRoot()
 	require.NoError(t, err)
 	util.SaveBlock(t, ctx, service.beaconDB, b1)
 	require.NoError(t, service.beaconDB.SaveStateSummary(ctx, &ethpb.StateSummary{Slot: 1, Root: r1[:]}))
 
-	b4, err := util.GenerateFullBlock(beaconState, pks, util.DefaultBlockGenConfig(), 4)
+	b64, err := util.GenerateFullBlock(state1, pks, util.DefaultBlockGenConfig(), 64)
 	require.NoError(t, err)
-	r4, err := b4.Block.HashTreeRoot()
+	r64, err := b64.Block.HashTreeRoot()
 	require.NoError(t, err)
-	util.SaveBlock(t, ctx, service.beaconDB, b4)
-	require.NoError(t, service.beaconDB.SaveStateSummary(ctx, &ethpb.StateSummary{Slot: 4, Root: r4[:]}))
+	util.SaveBlock(t, ctx, service.beaconDB, b64)
+	require.NoError(t, service.beaconDB.SaveStateSummary(ctx, &ethpb.StateSummary{Slot: 64, Root: r64[:]}))
+	require.NoError(t, service.beaconDB.SaveFinalizedCheckpoint(ctx, &ethpb.Checkpoint{Epoch: 2, Root: r64[:]}))
 	service.finalizedInfo = &finalizedInfo{
-		root:  genesisStateRoot,
+		root:  gRoot,
 		state: beaconState,
 	}
 
-	require.NoError(t, service.MigrateToCold(ctx, r4))
+	require.NoError(t, service.MigrateToCold(ctx, r64))
 
 	s1, err := service.beaconDB.State(ctx, r1)
 	require.NoError(t, err)
@@ -117,6 +134,7 @@ func TestMigrateToCold_RegeneratePath(t *testing.T) {
 	lastIndex, err := service.beaconDB.LastArchivedSlot(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, primitives.Slot(1), lastIndex, "Did not save last archived index")
+	assert.Equal(t, false, service.beaconDB.HasState(ctx, orphanRoot), "Saved state for orphaned block")
 
 	require.LogsContain(t, hook, "Saved state in DB")
 }
@@ -195,6 +213,7 @@ func TestMigrateToCold_ParallelCalls(t *testing.T) {
 	require.NoError(t, err)
 	util.SaveBlock(t, ctx, service.beaconDB, b7)
 	require.NoError(t, service.beaconDB.SaveStateSummary(ctx, &ethpb.StateSummary{Slot: 7, Root: r7[:]}))
+	require.NoError(t, service.beaconDB.SaveFinalizedCheckpoint(ctx, &ethpb.Checkpoint{Root: r7[:]}))
 
 	service.finalizedInfo = &finalizedInfo{
 		root:  genesisStateRoot,
@@ -353,218 +372,108 @@ func TestMigrateToColdHdiff_SkipsSlotsNotInDiffTree(t *testing.T) {
 // when all non-boundary slots are missed.
 func TestMigrateToColdHdiff_MissedNonBoundarySlots(t *testing.T) {
 	ctx := t.Context()
-	setStateDiffExponents()
-	beaconDB := testDB.SetupDB(t)
-	require.NoError(t, beaconDB.(*kv.Store).InitStateDiffCacheForTesting(t, 0))
-	resetCfg := features.InitWithReset(&features.Flags{EnableStateDiff: true})
-	defer resetCfg()
-	service := New(beaconDB, doublylinkedtree.New())
-
-	beaconState, _ := util.DeterministicGenesisState(t, 32)
-	genesisStateRoot, err := beaconState.HashTreeRoot(ctx)
-	require.NoError(t, err)
-	genesis := blocks.NewGenesisBlock(genesisStateRoot[:])
-	util.SaveBlock(t, ctx, beaconDB, genesis)
-	gRoot, err := genesis.Block.HashTreeRoot()
-	require.NoError(t, err)
-	require.NoError(t, beaconDB.SaveGenesisBlockRoot(ctx, gRoot))
-	// Slot 0 needs to exist as the base snapshot for level-1 state diff entries.
-	require.NoError(t, beaconDB.SaveState(ctx, beaconState, gRoot))
-
-	service.finalizedInfo = &finalizedInfo{
-		root:  gRoot,
-		state: beaconState,
+	chain := setupHdiffMigrationTestChain(t, 32, 64, 96, 128)
+	service := New(chain.db, doublylinkedtree.New())
+	service.finalizedInfo = &finalizedInfo{root: chain.roots[0], state: chain.states[0]}
+	for _, slot := range []primitives.Slot{32, 64, 96, 128} {
+		require.NoError(t, service.epochBoundaryStateCache.put(chain.roots[slot], chain.states[slot]))
 	}
+	chain.finalize(t, 128)
 
-	state32 := beaconState.Copy()
-	require.NoError(t, state32.SetSlot(32))
-	b32 := util.NewBeaconBlock()
-	b32.Block.Slot = 32
-	r32, err := b32.Block.HashTreeRoot()
-	require.NoError(t, err)
-	util.SaveBlock(t, ctx, beaconDB, b32)
-	require.NoError(t, service.epochBoundaryStateCache.put(r32, state32))
+	require.NoError(t, service.MigrateToCold(ctx, chain.roots[128]))
 
-	state64 := beaconState.Copy()
-	require.NoError(t, state64.SetSlot(64))
-	b64 := util.NewBeaconBlock()
-	b64.Block.Slot = 64
-	r64, err := b64.Block.HashTreeRoot()
-	require.NoError(t, err)
-	util.SaveBlock(t, ctx, beaconDB, b64)
-	require.NoError(t, service.epochBoundaryStateCache.put(r64, state64))
-
-	state96 := beaconState.Copy()
-	require.NoError(t, state96.SetSlot(96))
-	b96 := util.NewBeaconBlock()
-	b96.Block.Slot = 96
-	r96, err := b96.Block.HashTreeRoot()
-	require.NoError(t, err)
-	util.SaveBlock(t, ctx, beaconDB, b96)
-	require.NoError(t, service.epochBoundaryStateCache.put(r96, state96))
-
-	finalizedState := beaconState.Copy()
-	require.NoError(t, finalizedState.SetSlot(128))
-	b128 := util.NewBeaconBlock()
-	b128.Block.Slot = 128
-	r128, err := b128.Block.HashTreeRoot()
-	require.NoError(t, err)
-	util.SaveBlock(t, ctx, beaconDB, b128)
-	require.NoError(t, service.epochBoundaryStateCache.put(r128, finalizedState))
-
-	require.NoError(t, service.MigrateToCold(ctx, r128))
-
-	assert.Equal(t, true, beaconDB.HasState(ctx, r32), "Did not save slot 32 checkpoint to database")
-	assert.Equal(t, true, beaconDB.HasState(ctx, r64), "Did not save slot 64 checkpoint to database")
-	assert.Equal(t, true, beaconDB.HasState(ctx, r96), "Did not save slot 96 checkpoint to database")
+	for _, slot := range []primitives.Slot{32, 64, 96} {
+		got, err := chain.db.State(ctx, chain.roots[slot])
+		require.NoError(t, err)
+		wantRoot, err := chain.states[slot].HashTreeRoot(ctx)
+		require.NoError(t, err)
+		gotRoot, err := got.HashTreeRoot(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, wantRoot, gotRoot, "state root mismatch")
+	}
 }
 
-// TestMigrateToColdHdiff_MissedNonBoundarySlots verifies migration
-// when all non-boundary slots are missed, and the epoch boundary cache
-// is also missed for slot 96.
+// TestMigrateToColdHdiff_MissedNonBoundarySlots_BoundaryCacheMissed simulates a
+// restart after the boundary cache has been lost.
 func TestMigrateToColdHdiff_MissedNonBoundarySlots_BoundaryCacheMissed(t *testing.T) {
 	ctx := t.Context()
-	setStateDiffExponents()
-	beaconDB := testDB.SetupDB(t)
-	require.NoError(t, beaconDB.(*kv.Store).InitStateDiffCacheForTesting(t, 0))
-	resetCfg := features.InitWithReset(&features.Flags{EnableStateDiff: true})
-	defer resetCfg()
-	service := New(beaconDB, doublylinkedtree.New())
+	chain := setupHdiffMigrationTestChain(t, 32, 64, 96, 128)
+	service := New(chain.db, doublylinkedtree.New())
+	service.finalizedInfo = &finalizedInfo{root: chain.roots[0], state: chain.states[0]}
+	chain.finalize(t, 128)
 
-	beaconState, _ := util.DeterministicGenesisState(t, 32)
-	genesisStateRoot, err := beaconState.HashTreeRoot(ctx)
-	require.NoError(t, err)
-	genesis := blocks.NewGenesisBlock(genesisStateRoot[:])
-	util.SaveBlock(t, ctx, beaconDB, genesis)
-	gRoot, err := genesis.Block.HashTreeRoot()
-	require.NoError(t, err)
-	require.NoError(t, beaconDB.SaveGenesisBlockRoot(ctx, gRoot))
-	// Slot 0 needs to exist as the base snapshot for level-1 state diff entries.
-	require.NoError(t, beaconDB.SaveState(ctx, beaconState, gRoot))
+	require.NoError(t, service.MigrateToCold(ctx, chain.roots[128]))
 
-	service.finalizedInfo = &finalizedInfo{
-		root:  gRoot,
-		state: beaconState,
+	for _, slot := range []primitives.Slot{32, 64, 96} {
+		got, err := chain.db.State(ctx, chain.roots[slot])
+		require.NoError(t, err)
+		wantRoot, err := chain.states[slot].HashTreeRoot(ctx)
+		require.NoError(t, err)
+		gotRoot, err := got.HashTreeRoot(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, wantRoot, gotRoot, "state root mismatch")
 	}
-
-	state32 := beaconState.Copy()
-	require.NoError(t, state32.SetSlot(32))
-	b32 := util.NewBeaconBlock()
-	b32.Block.Slot = 32
-	r32, err := b32.Block.HashTreeRoot()
-	require.NoError(t, err)
-	util.SaveBlock(t, ctx, beaconDB, b32)
-	require.NoError(t, service.epochBoundaryStateCache.put(r32, state32))
-
-	state64 := beaconState.Copy()
-	require.NoError(t, state64.SetSlot(64))
-	b64 := util.NewBeaconBlock()
-	b64.Block.Slot = 64
-	r64, err := b64.Block.HashTreeRoot()
-	require.NoError(t, err)
-	util.SaveBlock(t, ctx, beaconDB, b64)
-	require.NoError(t, service.epochBoundaryStateCache.put(r64, state64))
-
-	state96 := beaconState.Copy()
-	require.NoError(t, state96.SetSlot(96))
-	b96 := util.NewBeaconBlock()
-	b96.Block.Slot = 96
-	r96, err := b96.Block.HashTreeRoot()
-	require.NoError(t, err)
-	util.SaveBlock(t, ctx, beaconDB, b96)
-	// Simulate epoch boundary cache miss for slot 96 while hot cache still has the state.
-	// this makes sure the call to StateByRoot doesn't fail here.
-	service.hotStateCache.put(r96, state96)
-
-	b128 := util.NewBeaconBlock()
-	b128.Block.Slot = 128
-	r128, err := b128.Block.HashTreeRoot()
-	require.NoError(t, err)
-	util.SaveBlock(t, ctx, beaconDB, b128)
-	require.NoError(t, service.MigrateToCold(ctx, r128))
-
-	assert.Equal(t, true, beaconDB.HasState(ctx, r32), "Did not save slot 32 checkpoint to database")
-	assert.Equal(t, true, beaconDB.HasState(ctx, r64), "Did not save slot 64 checkpoint to database")
-	assert.Equal(t, true, beaconDB.HasState(ctx, r96), "Did not save slot 96 checkpoint to database")
 	assert.Equal(t, primitives.Slot(128), service.migratedSlot)
-	assert.DeepEqual(t, gRoot, service.finalizedInfo.root)
+	assert.DeepEqual(t, chain.roots[0], service.finalizedInfo.root)
 	assert.Equal(t, primitives.Slot(0), service.finalizedInfo.state.Slot())
 }
 
-// TestMigrateToColdHdiff_BoundaryCacheMiss_UseTargetSlotRoot verifies that a
-// cache miss at a diff-tree slot still migrates using the block root at that
-// slot (or an equivalent <= slot selection), rather than strictly below it.
-func TestMigrateToColdHdiff_BoundaryCacheMiss_UseTargetSlotRoot(t *testing.T) {
+// TestMigrateToColdHdiff_BoundaryCacheMiss_SelectsCanonicalRoot verifies that
+// the finalized block index selects the canonical root when the slot index also has an orphan.
+func TestMigrateToColdHdiff_BoundaryCacheMiss_SelectsCanonicalRoot(t *testing.T) {
 	ctx := t.Context()
-	setStateDiffExponents()
-	beaconDB := testDB.SetupDB(t)
-	require.NoError(t, beaconDB.(*kv.Store).InitStateDiffCacheForTesting(t, 0))
-	resetCfg := features.InitWithReset(&features.Flags{EnableStateDiff: true})
-	defer resetCfg()
-	service := New(beaconDB, doublylinkedtree.New())
+	chain := setupHdiffMigrationTestChain(t, 32, 64, 96, 128)
 
-	genesisState, pks := util.DeterministicGenesisState(t, 32)
-	genesisStateRoot, err := genesisState.HashTreeRoot(ctx)
-	require.NoError(t, err)
-	genesis := blocks.NewGenesisBlock(genesisStateRoot[:])
-	util.SaveBlock(t, ctx, beaconDB, genesis)
-	gRoot, err := genesis.Block.HashTreeRoot()
-	require.NoError(t, err)
-	require.NoError(t, beaconDB.SaveGenesisBlockRoot(ctx, gRoot))
-	// Slot 0 base snapshot for state-diff.
-	require.NoError(t, beaconDB.SaveState(ctx, genesisState, gRoot))
-	require.NoError(t, beaconDB.SaveStateSummary(ctx, &ethpb.StateSummary{Slot: 0, Root: gRoot[:]}))
-
-	service.finalizedInfo = &finalizedInfo{
-		root:  gRoot,
-		state: genesisState,
-	}
-
-	current := genesisState
-	var (
-		r32, r64, r96, r128 [32]byte
-		s32, s64, s96, s128 state.BeaconState
-	)
-	for _, slot := range []primitives.Slot{32, 64, 96, 128} {
-		b, err := util.GenerateFullBlock(current, pks, util.DefaultBlockGenConfig(), slot)
-		require.NoError(t, err)
-		wsb, err := consensusblocks.NewSignedBeaconBlock(b)
-		require.NoError(t, err)
-		nextState, err := executeStateTransitionStateGen(ctx, current, wsb)
-		require.NoError(t, err)
-		root, err := b.Block.HashTreeRoot()
-		require.NoError(t, err)
-		util.SaveBlock(t, ctx, beaconDB, b)
-		require.NoError(t, beaconDB.SaveStateSummary(ctx, &ethpb.StateSummary{Slot: slot, Root: root[:]}))
-
-		current = nextState
-		switch slot {
-		case 32:
-			r32 = root
-			s32 = nextState.Copy()
-		case 64:
-			r64 = root
-			s64 = nextState.Copy()
-		case 96:
-			r96 = root
-			s96 = nextState.Copy()
-		case 128:
-			r128 = root
-			s128 = nextState.Copy()
-		}
-	}
+	// Add an orphaned block at slot 96.
+	orphanConfig := util.DefaultBlockGenConfig()
+	orphanConfig.NumAttestations = 0
+	orphanRoot, _ := chain.addBlock(t, chain.states[64], orphanConfig, 96)
+	service := New(chain.db, doublylinkedtree.New())
+	service.finalizedInfo = &finalizedInfo{root: chain.roots[0], state: chain.states[0]}
 
 	// Simulate cache eviction for slot 96 only: keep 32/64 and finalized 128.
-	require.NoError(t, service.epochBoundaryStateCache.put(r32, s32))
-	require.NoError(t, service.epochBoundaryStateCache.put(r64, s64))
-	require.NoError(t, service.epochBoundaryStateCache.put(r128, s128))
+	for _, slot := range []primitives.Slot{32, 64, 128} {
+		require.NoError(t, service.epochBoundaryStateCache.put(chain.roots[slot], chain.states[slot]))
+	}
 
-	require.NoError(t, service.MigrateToCold(ctx, r128))
+	chain.finalize(t, 128)
+	assert.Equal(t, true, chain.db.IsFinalizedBlock(ctx, chain.roots[96]), "Canonical root was not finalized")
+	assert.Equal(t, false, chain.db.IsFinalizedBlock(ctx, orphanRoot), "Orphan root was finalized")
+
+	require.NoError(t, service.MigrateToCold(ctx, chain.roots[128]))
 
 	// State by the slot-96 root should remain reconstructible after migration.
-	got96, err := beaconDB.State(ctx, r96)
+	got96, err := chain.db.State(ctx, chain.roots[96])
 	require.NoError(t, err)
-	assert.DeepSSZEqual(t, s96.ToProtoUnsafe(), got96.ToProtoUnsafe(), "slot 96 state mismatch")
+	wantRoot, err := chain.states[96].HashTreeRoot(ctx)
+	require.NoError(t, err)
+	gotRoot, err := got96.HashTreeRoot(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, wantRoot, gotRoot, "slot 96 state root mismatch")
+	_, err = chain.db.State(ctx, orphanRoot)
+	require.ErrorContains(t, "state root mismatch", err)
+}
+
+func TestMigrateToColdHdiff_OrphanOnlyBoundaryUsesFinalizedAncestry(t *testing.T) {
+	ctx := t.Context()
+	chain := setupHdiffMigrationTestChain(t, 32, 64, 128)
+	orphanConfig := util.DefaultBlockGenConfig()
+	orphanConfig.NumAttestations = 0
+	orphanRoot, _ := chain.addBlock(t, chain.states[64], orphanConfig, 96)
+	service := New(chain.db, doublylinkedtree.New())
+	service.finalizedInfo = &finalizedInfo{root: chain.roots[0], state: chain.states[0]}
+	chain.finalize(t, 128)
+
+	require.NoError(t, service.MigrateToCold(ctx, chain.roots[128]))
+
+	// There is no canonical root at slot 96 in this fixture, so the root-keyed
+	// read can only exclude the orphan. The preceding test positively reads its
+	// canonical slot-96 root.
+	_, err := chain.db.State(ctx, orphanRoot)
+	require.ErrorContains(t, "state root mismatch", err)
+	assert.Equal(t, primitives.Slot(128), service.migratedSlot)
+	assert.DeepEqual(t, chain.roots[0], service.finalizedInfo.root)
+	assert.Equal(t, primitives.Slot(0), service.finalizedInfo.state.Slot())
 }
 
 // TestMigrateToColdHdiff_NoOpWhenFinalizedSlotNotAdvanced verifies that
@@ -609,4 +518,77 @@ func TestMigrateToColdHdiff_NoOpWhenFinalizedSlotNotAdvanced(t *testing.T) {
 
 	// Migration should be a no-op (finalized slot not advancing).
 	require.NoError(t, service.MigrateToCold(ctx, fRoot))
+}
+
+// hdiffMigrationTestChain is a helper struct for setting up a test chain
+// with finalized blocks and states for testing state diff migration.
+type hdiffMigrationTestChain struct {
+	db     *kv.Store
+	keys   []bls.SecretKey
+	roots  map[primitives.Slot][32]byte
+	states map[primitives.Slot]state.BeaconState
+}
+
+func setupHdiffMigrationTestChain(t *testing.T, slots ...primitives.Slot) *hdiffMigrationTestChain {
+	t.Helper()
+	ctx := t.Context()
+	setStateDiffExponents()
+	db := testDB.SetupDB(t).(*kv.Store)
+	require.NoError(t, db.InitStateDiffCacheForTesting(t, 0))
+	t.Cleanup(features.InitWithReset(&features.Flags{EnableStateDiff: true}))
+
+	genesisState, keys := util.DeterministicGenesisState(t, 32)
+	genesisStateRoot, err := genesisState.HashTreeRoot(ctx)
+	require.NoError(t, err)
+	genesis := blocks.NewGenesisBlock(genesisStateRoot[:])
+	util.SaveBlock(t, ctx, db, genesis)
+	genesisRoot, err := genesis.Block.HashTreeRoot()
+	require.NoError(t, err)
+	require.NoError(t, db.SaveGenesisBlockRoot(ctx, genesisRoot))
+	require.NoError(t, db.SaveState(ctx, genesisState, genesisRoot))
+	require.NoError(t, db.SaveStateSummary(ctx, &ethpb.StateSummary{Slot: 0, Root: genesisRoot[:]}))
+
+	chain := &hdiffMigrationTestChain{
+		db:     db,
+		keys:   keys,
+		roots:  map[primitives.Slot][32]byte{0: genesisRoot},
+		states: map[primitives.Slot]state.BeaconState{0: genesisState},
+	}
+	current := genesisState
+	for _, slot := range slots {
+		root, nextState := chain.addBlock(t, current, util.DefaultBlockGenConfig(), slot)
+		chain.roots[slot] = root
+		chain.states[slot] = nextState
+		current = nextState
+	}
+	return chain
+}
+
+func (chain *hdiffMigrationTestChain) finalize(t *testing.T, slot primitives.Slot) {
+	t.Helper()
+	root := chain.roots[slot]
+	require.NoError(t, chain.db.SaveFinalizedCheckpoint(t.Context(), &ethpb.Checkpoint{
+		Epoch: primitives.Epoch(slot / params.BeaconConfig().SlotsPerEpoch),
+		Root:  root[:],
+	}))
+}
+
+func (chain *hdiffMigrationTestChain) addBlock(
+	t *testing.T,
+	preState state.BeaconState,
+	config *util.BlockGenConfig,
+	slot primitives.Slot,
+) ([32]byte, state.BeaconState) {
+	t.Helper()
+	block, err := util.GenerateFullBlock(preState, chain.keys, config, slot)
+	require.NoError(t, err)
+	signed, err := consensusblocks.NewSignedBeaconBlock(block)
+	require.NoError(t, err)
+	postState, err := executeStateTransitionStateGen(t.Context(), preState.Copy(), signed)
+	require.NoError(t, err)
+	root, err := block.Block.HashTreeRoot()
+	require.NoError(t, err)
+	util.SaveBlock(t, t.Context(), chain.db, block)
+	require.NoError(t, chain.db.SaveStateSummary(t.Context(), &ethpb.StateSummary{Slot: slot, Root: root[:]}))
+	return root, postState.Copy()
 }
