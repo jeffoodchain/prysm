@@ -20,6 +20,7 @@ import (
 )
 
 const (
+	syncAggregateFieldIndex             = 8
 	payloadFieldIndex                   = 9
 	signedExecutionPayloadBidFieldIndex = 10
 	parentBlockHashFieldIndex           = 0
@@ -288,6 +289,44 @@ func PayloadProof(ctx context.Context, block interfaces.ReadOnlyBeaconBlock) ([]
 
 	fieldRootsTrie := stateutil.Merkleize(fieldRoots)
 	proof := trie.ProofFromMerkleLayers(fieldRootsTrie, payloadFieldIndex)
+
+	return proof, nil
+}
+
+// SyncAggregateProof returns the Merkle branch that proves
+// BeaconBlockBody.sync_aggregate against the block body root.
+// Altair through Fulue use the balanced body tree: gindex 24, 4 nodes.
+// Gloas uses the progressive container tree: gindex 355, 8 nodes.
+func SyncAggregateProof(ctx context.Context, block interfaces.ReadOnlyBeaconBlock) ([][]byte, error) {
+	if block.Version() < version.Altair {
+		return nil, errors.New("sync aggregate proof is not supported in Phase0")
+	}
+
+	i := block.Body()
+	blockBody, ok := i.(*BeaconBlockBody)
+	if !ok {
+		return nil, errors.New("failed to cast block body")
+	}
+
+	fieldRoots, err := ComputeBlockBodyFieldRoots(ctx, blockBody)
+	if err != nil {
+		return nil, err
+	}
+
+	if block.Version() >= version.Gloas {
+		proof, err := progressiveContainerFieldProof(
+			fieldRoots,
+			syncAggregateFieldIndex,
+			block.Version(),
+			beaconBlockBodyProgressiveContainer,
+		)
+		if err != nil {
+			return nil, err
+		}
+		return proof, nil
+	}
+	fieldRootsTrie := stateutil.Merkleize(fieldRoots)
+	proof := trie.ProofFromMerkleLayers(fieldRootsTrie, syncAggregateFieldIndex)
 
 	return proof, nil
 }
