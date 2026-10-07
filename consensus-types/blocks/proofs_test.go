@@ -1,6 +1,7 @@
 package blocks
 
 import (
+	"math/bits"
 	"testing"
 
 	methodicalssz "github.com/OffchainLabs/methodical-ssz/ssz"
@@ -320,5 +321,48 @@ func TestExecutionBlockHashProof(t *testing.T) {
 		block.body.signedExecutionPayloadBid.Signature = nil
 		_, err := ExecutionBlockHashProof(t.Context(), block)
 		require.ErrorIs(t, err, methodicalssz.ErrBytesLength)
+	})
+}
+
+// TestSyncAggregateProof checks the branch that proves BeaconBlockBody.sync_aggregate against the body root.
+// The body is a 16-leaf tree from Altair through Fulu (gindex 24) and a progressive container in Gloas (gindex 355).
+func TestSyncAggregateProof(t *testing.T) {
+	tests := []struct {
+		block  any
+		gindex uint64
+	}{
+		{&eth.BeaconBlockAltair{Body: hydrateBeaconBlockBodyAltair()}, 24},
+		{&eth.BeaconBlockBellatrix{Body: hydrateBeaconBlockBodyBellatrix()}, 24},
+		{&eth.BeaconBlockCapella{Body: hydrateBeaconBlockBodyCapella()}, 24},
+		{&eth.BeaconBlockDeneb{Body: hydrateBeaconBlockBodyDeneb()}, 24},
+		{&eth.BeaconBlockElectra{Body: hydrateBeaconBlockBodyElectra()}, 24},
+		{&eth.GenericBeaconBlock_Fulu{Fulu: &eth.BeaconBlockContentsFulu{
+			Block: &eth.BeaconBlockElectra{Body: hydrateBeaconBlockBodyElectra()},
+		}}, 24},
+		{&eth.BeaconBlockGloas{Body: hydrateBeaconBlockBodyGloas()}, 355},
+	}
+	for _, tt := range tests {
+		block, err := NewBeaconBlock(tt.block)
+		require.NoError(t, err)
+		t.Run(version.String(block.Version()), func(t *testing.T) {
+			proof, err := SyncAggregateProof(t.Context(), block)
+			require.NoError(t, err)
+			bodyRoot, err := block.Body().HashTreeRoot()
+			require.NoError(t, err)
+			syncAggregate, err := block.Body().SyncAggregate()
+			require.NoError(t, err)
+			syncAggregateRoot, err := syncAggregate.HashTreeRoot()
+			require.NoError(t, err)
+			// A branch holds floorlog2(gindex) nodes. VerifyMerkleProof does not check this.
+			require.Equal(t, bits.Len64(tt.gindex)-1, len(proof))
+			require.Equal(t, true, trie.VerifyMerkleProof(bodyRoot[:], syncAggregateRoot[:], tt.gindex, proof))
+		})
+	}
+
+	t.Run("rejects phase0", func(t *testing.T) {
+		block, err := NewBeaconBlock(hydrateBeaconBlock())
+		require.NoError(t, err)
+		_, err = SyncAggregateProof(t.Context(), block)
+		require.NotNil(t, err)
 	})
 }
