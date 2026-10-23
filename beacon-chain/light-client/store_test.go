@@ -9,10 +9,13 @@ import (
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/db"
 	testDB "github.com/OffchainLabs/prysm/v7/beacon-chain/db/testing"
 	p2pTesting "github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/testing"
+	fieldparams "github.com/OffchainLabs/prysm/v7/config/fieldparams"
 	"github.com/OffchainLabs/prysm/v7/config/params"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/interfaces"
+	light_client "github.com/OffchainLabs/prysm/v7/consensus-types/light-client"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
+	"github.com/OffchainLabs/prysm/v7/encoding/bytesutil"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	"github.com/OffchainLabs/prysm/v7/runtime/version"
 	"github.com/OffchainLabs/prysm/v7/testing/require"
@@ -967,4 +970,189 @@ func saveStateAndBlockWithParentRoot(t *testing.T, ctx context.Context, d db.Dat
 	require.NoError(t, err)
 
 	return blkRoot, signedFinalizedBlock
+}
+
+// block_data index of the checkpoint block in test epoch data.
+const (
+	checkpointAtStart     = fieldparams.SlotsPerEpoch - 1 // block at the epoch's start slot
+	checkpointBeforeStart = fieldparams.SlotsPerEpoch - 2 // start slot empty, block in the previous epoch
+	noCheckpoint          = -1                            // no block in block_data
+)
+
+// setupEpochDataStore uses periods of 4 epochs. It stores epoch data with the checkpoint block
+// at the given block_data index, and a distinct committee for each of periods 0 to 3.
+func setupEpochDataStore(t *testing.T, checkpoints map[primitives.Epoch]int) (*Store, map[uint64]*ethpb.SyncCommittee) {
+	params.SetupTestConfigCleanup(t)
+	cfg := params.MainnetConfig().Copy()
+	cfg.AltairForkEpoch = 0
+	cfg.EpochsPerSyncCommitteePeriod = 4
+	params.OverrideBeaconConfig(cfg)
+
+	ctx := t.Context()
+	d := testDB.SetupDB(t)
+	var data []light_client.EpochData
+	for epoch, i := range checkpoints {
+		data = append(data, util.NewLightClientEpochDataAltair(epoch, i))
+	}
+	require.NoError(t, d.SaveLightClientEpochData(ctx, data))
+
+	committees := make(map[uint64]*ethpb.SyncCommittee)
+	for period := range uint64(4) {
+		pubkeys := make([][]byte, fieldparams.SyncCommitteeLength)
+		for i := range pubkeys {
+			pubkeys[i] = bytesutil.PadTo([]byte{byte(period)}, fieldparams.BLSPubkeyLength)
+		}
+		committees[period] = &ethpb.SyncCommittee{Pubkeys: pubkeys, AggregatePubkey: bytesutil.PadTo([]byte{byte(period)}, fieldparams.BLSPubkeyLength)}
+		require.NoError(t, d.SaveLightClientPeriodSyncCommittee(ctx, period, committees[period]))
+	}
+	return NewLightClientStore(&p2pTesting.FakeP2P{}, new(event.Feed), d), committees
+}
+
+func TestStore_LightClientEpochDataByRange(t *testing.T) {
+	// Epochs 0 to 9 without 6.
+	checkpoints := make(map[primitives.Epoch]int)
+	for epoch := range primitives.Epoch(10) {
+		if epoch != 6 {
+			checkpoints[epoch] = checkpointAtStart
+		}
+	}
+	s, _ := setupEpochDataStore(t, checkpoints)
+
+	for _, tc := range []struct {
+		name      string
+		last      primitives.Epoch
+		count     uint64
+		finalized primitives.Epoch
+		want      []primitives.Epoch
+	}{
+		{name: "walks down from last epoch", last: 5, count: 3, finalized: 9, want: []primitives.Epoch{5, 4, 3}},
+		{name: "stops at a missing epoch", last: 9, count: 5, finalized: 9, want: []primitives.Epoch{9, 8, 7}},
+		{name: "stops at epoch 0", last: 2, count: 5, finalized: 9, want: []primitives.Epoch{2, 1, 0}},
+		{name: "last epoch is missing", last: 6, count: 5, finalized: 9},
+		{name: "last epoch is after finalized", last: 9, count: 5, finalized: 8},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data, err := s.LightClientEpochDataByRange(t.Context(), tc.last, tc.count, tc.finalized)
+			require.NoError(t, err)
+			var got []primitives.Epoch
+			for _, d := range data {
+				got = append(got, d.GetEpoch())
+			}
+			require.DeepEqual(t, tc.want, got)
+		})
+	}
+}
+
+func TestStore_LightClientEpochDataByRange_SyncCommittee(t *testing.T) {
+	// Period 0 is epochs 0 to 3, period 1 is epochs 4 to 7, period 2 starts at epoch 8.
+	for _, tc := range []struct {
+		name        string
+		checkpoints map[primitives.Epoch]int
+		last        primitives.Epoch
+		count       uint64
+		finalized   primitives.Epoch
+		want        map[primitives.Epoch]uint64 // epoch -> period of the committee it carries
+	}{
+		{
+			name:        "last checkpoint of each period",
+			checkpoints: map[primitives.Epoch]int{2: checkpointAtStart, 3: checkpointAtStart, 4: checkpointAtStart, 5: checkpointAtStart, 6: checkpointAtStart, 7: checkpointAtStart, 8: checkpointAtStart, 9: checkpointAtStart},
+			last:        9, count: 8, finalized: 9,
+			want: map[primitives.Epoch]uint64{3: 0, 7: 1},
+		},
+		{
+			name:        "start slot of the next period is empty",
+			checkpoints: map[primitives.Epoch]int{6: checkpointAtStart, 7: checkpointAtStart, 8: checkpointBeforeStart, 9: checkpointAtStart},
+			last:        9, count: 4, finalized: 9,
+			want: map[primitives.Epoch]uint64{8: 1},
+		},
+		{
+			name:        "newest epoch has its checkpoint in the previous period",
+			checkpoints: map[primitives.Epoch]int{7: checkpointAtStart, 8: checkpointBeforeStart},
+			last:        8, count: 2, finalized: 8,
+			want: map[primitives.Epoch]uint64{8: 1},
+		},
+		{
+			name:        "next checkpoint after last epoch",
+			checkpoints: map[primitives.Epoch]int{7: checkpointAtStart, 8: checkpointAtStart},
+			last:        7, count: 1, finalized: 8,
+			want: map[primitives.Epoch]uint64{7: 1},
+		},
+		{
+			name:        "next checkpoint after last epoch is in the same period",
+			checkpoints: map[primitives.Epoch]int{7: checkpointAtStart, 8: checkpointBeforeStart},
+			last:        7, count: 1, finalized: 8,
+		},
+		{
+			name:        "next checkpoint is not finalized",
+			checkpoints: map[primitives.Epoch]int{7: checkpointAtStart, 8: checkpointAtStart},
+			last:        7, count: 1, finalized: 7,
+		},
+		{
+			name:        "next checkpoint is not stored",
+			checkpoints: map[primitives.Epoch]int{6: checkpointAtStart, 7: checkpointAtStart},
+			last:        7, count: 2, finalized: 9,
+		},
+		{
+			name:        "empty epoch before the next checkpoint",
+			checkpoints: map[primitives.Epoch]int{6: checkpointAtStart, 7: noCheckpoint, 8: checkpointAtStart},
+			last:        8, count: 3, finalized: 8,
+			want: map[primitives.Epoch]uint64{6: 1},
+		},
+		{
+			name:        "empty epoch after last epoch",
+			checkpoints: map[primitives.Epoch]int{6: checkpointAtStart, 7: noCheckpoint, 8: checkpointAtStart},
+			last:        6, count: 1, finalized: 8,
+			want: map[primitives.Epoch]uint64{6: 1},
+		},
+		{
+			name:        "empty epochs into the next period",
+			checkpoints: map[primitives.Epoch]int{6: checkpointAtStart, 7: noCheckpoint, 8: noCheckpoint},
+			last:        6, count: 1, finalized: 9,
+			want: map[primitives.Epoch]uint64{6: 1},
+		},
+		{
+			name:        "empty newest epoch",
+			checkpoints: map[primitives.Epoch]int{6: checkpointAtStart, 7: noCheckpoint},
+			last:        7, count: 2, finalized: 9,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, committees := setupEpochDataStore(t, tc.checkpoints)
+			data, err := s.LightClientEpochDataByRange(t.Context(), tc.last, tc.count, tc.finalized)
+			require.NoError(t, err)
+			require.Equal(t, int(tc.count), len(data))
+			for _, d := range data {
+				got := d.(*ethpb.LightClientEpochDataAltair).BootstrapData.CurrentSyncCommittee
+				period, ok := tc.want[d.GetEpoch()]
+				if !ok {
+					require.Equal(t, 0, len(got), "epoch %d", d.GetEpoch())
+					continue
+				}
+				require.Equal(t, 1, len(got), "epoch %d", d.GetEpoch())
+				require.DeepEqual(t, committees[period], got[0], "epoch %d", d.GetEpoch())
+			}
+		})
+	}
+}
+
+func TestStore_LightClientEpochDataByRange_MissingSyncCommittee(t *testing.T) {
+	// Epoch 19 is the last checkpoint of period 4, which has no stored committee.
+	s, _ := setupEpochDataStore(t, map[primitives.Epoch]int{19: checkpointAtStart, 20: checkpointAtStart})
+	_, err := s.LightClientEpochDataByRange(t.Context(), 20, 2, 20)
+	require.ErrorContains(t, "no sync committee stored for period 4", err)
+}
+
+func TestSetEpochDataSyncCommittee(t *testing.T) {
+	committee := &ethpb.SyncCommittee{AggregatePubkey: []byte{1}}
+	c := []*ethpb.SyncCommittee{committee}
+	for _, tc := range []struct{ got, want light_client.EpochData }{
+		{&ethpb.LightClientEpochDataAltair{BootstrapData: &ethpb.LightClientBootstrapDataAltair{}}, &ethpb.LightClientEpochDataAltair{BootstrapData: &ethpb.LightClientBootstrapDataAltair{CurrentSyncCommittee: c}}},
+		{&ethpb.LightClientEpochDataCapella{BootstrapData: &ethpb.LightClientBootstrapDataCapella{}}, &ethpb.LightClientEpochDataCapella{BootstrapData: &ethpb.LightClientBootstrapDataCapella{CurrentSyncCommittee: c}}},
+		{&ethpb.LightClientEpochDataDeneb{BootstrapData: &ethpb.LightClientBootstrapDataDeneb{}}, &ethpb.LightClientEpochDataDeneb{BootstrapData: &ethpb.LightClientBootstrapDataDeneb{CurrentSyncCommittee: c}}},
+		{&ethpb.LightClientEpochDataElectra{BootstrapData: &ethpb.LightClientBootstrapDataElectra{}}, &ethpb.LightClientEpochDataElectra{BootstrapData: &ethpb.LightClientBootstrapDataElectra{CurrentSyncCommittee: c}}},
+		{&ethpb.LightClientEpochDataGloas{BootstrapData: &ethpb.LightClientBootstrapDataGloas{}}, &ethpb.LightClientEpochDataGloas{BootstrapData: &ethpb.LightClientBootstrapDataGloas{CurrentSyncCommittee: c}}},
+	} {
+		require.NoError(t, setEpochDataSyncCommittee(tc.got, committee))
+		require.DeepEqual(t, tc.want, tc.got)
+	}
 }

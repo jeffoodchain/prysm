@@ -12,6 +12,9 @@ import (
 )
 
 const (
+	// SchemaVersionV0 specifies the schema version 0 for our rpc protocol ID.
+	SchemaVersionV0 = "/0"
+
 	// SchemaVersionV1 specifies the schema version for our rpc protocol ID.
 	SchemaVersionV1 = "/1"
 
@@ -62,6 +65,9 @@ const (
 	// LightClientOptimisticUpdateName is the name for the LightClientOptimisticUpdate topic.
 	LightClientOptimisticUpdateName = "/light_client_optimistic_update"
 
+	// LightClientEpochDataByRangeName is the name for the LightClientEpochDataByRange topic.
+	LightClientEpochDataByRangeName = "/light_client_epoch_data_by_range"
+
 	// DataColumnSidecarsByRootName is the name for the DataColumnSidecarsByRoot v1 message topic.
 	DataColumnSidecarsByRootName = "/data_column_sidecars_by_root"
 
@@ -106,6 +112,8 @@ const (
 	RPCLightClientFinalityUpdateTopicV1 = protocolPrefix + LightClientFinalityUpdateName + SchemaVersionV1
 	// RPCLightClientOptimisticUpdateTopicV1 is a topic for requesting a light client Optimistic update.
 	RPCLightClientOptimisticUpdateTopicV1 = protocolPrefix + LightClientOptimisticUpdateName + SchemaVersionV1
+	// RPCLightClientEpochDataByRangeTopicV0 is a topic for requesting light client epoch data by range.
+	RPCLightClientEpochDataByRangeTopicV0 = protocolPrefix + LightClientEpochDataByRangeName + SchemaVersionV0
 	// RPCDataColumnSidecarsByRootTopicV1 is a topic for requesting data column sidecars by their block root.
 	// /eth2/beacon_chain/req/data_column_sidecars_by_root/1 - New in Fulu.
 	RPCDataColumnSidecarsByRootTopicV1 = protocolPrefix + DataColumnSidecarsByRootName + SchemaVersionV1
@@ -177,6 +185,7 @@ var (
 		RPCLightClientUpdatesByRangeTopicV1:   new(pb.LightClientUpdatesByRangeRequest),
 		RPCLightClientFinalityUpdateTopicV1:   new(any),
 		RPCLightClientOptimisticUpdateTopicV1: new(any),
+		RPCLightClientEpochDataByRangeTopicV0: new(pb.LightClientEpochDataByRangeRequest),
 
 		// DataColumnSidecarsByRange v1 Message
 		RPCDataColumnSidecarsByRangeTopicV1: new(pb.DataColumnSidecarsByRangeRequest),
@@ -210,6 +219,7 @@ var (
 		LightClientUpdatesByRangeName:        true,
 		LightClientFinalityUpdateName:        true,
 		LightClientOptimisticUpdateName:      true,
+		LightClientEpochDataByRangeName:      true,
 		DataColumnSidecarsByRootName:         true,
 		DataColumnSidecarsByRangeName:        true,
 		ExecutionPayloadEnvelopesByRootName:  true,
@@ -230,6 +240,7 @@ var (
 	}
 
 	versionMapping = map[string]bool{
+		SchemaVersionV0: true,
 		SchemaVersionV1: true,
 		SchemaVersionV2: true,
 		SchemaVersionV3: true,

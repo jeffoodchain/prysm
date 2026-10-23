@@ -8,6 +8,7 @@ import (
 	"github.com/OffchainLabs/prysm/v7/config/params"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/interfaces"
+	light_client "github.com/OffchainLabs/prysm/v7/consensus-types/light-client"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	"github.com/OffchainLabs/prysm/v7/time/slots"
@@ -161,6 +162,23 @@ func WriteLightClientFinalityUpdateChunk(stream libp2pcore.Stream, tor blockchai
 		return err
 	}
 	_, err := encoding.EncodeWithMaxLength(stream, update)
+	return err
+}
+
+// WriteLightClientEpochDataChunk writes a light client epoch data chunk to the stream.
+func WriteLightClientEpochDataChunk(stream libp2pcore.Stream, encoding encoder.NetworkEncoding, data light_client.EpochData) error {
+	slot, err := light_client.EpochDataForkSlot(data)
+	if err != nil {
+		return err
+	}
+	if _, err := stream.Write([]byte{responseCodeSuccess}); err != nil {
+		return err
+	}
+	digest := params.ForkDigest(slots.ToEpoch(slot))
+	if err := writeContextToStream(digest[:], stream); err != nil {
+		return err
+	}
+	_, err = encoding.EncodeWithMaxLength(stream, data)
 	return err
 }
 

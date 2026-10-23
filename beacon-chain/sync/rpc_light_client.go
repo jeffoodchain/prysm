@@ -152,6 +152,66 @@ func (s *Service) lightClientUpdatesByRangeRPCHandler(ctx context.Context, msg a
 	return nil
 }
 
+// lightClientEpochDataByRangeRPCHandler handles the /eth2/beacon_chain/req/light_client_epoch_data_by_range/0/ RPC request.
+func (s *Service) lightClientEpochDataByRangeRPCHandler(ctx context.Context, msg any, stream libp2pcore.Stream) error {
+	ctx, span := trace.StartSpan(ctx, "sync.lightClientEpochDataByRangeRPCHandler")
+	defer span.End()
+	ctx, cancel := context.WithTimeout(ctx, ttfbTimeout)
+	defer cancel()
+
+	logger := log.WithField("handler", p2p.LightClientEpochDataByRangeName[1:])
+	remotePeer := stream.Conn().RemotePeer()
+
+	SetRPCStreamDeadlines(stream)
+	if err := s.rateLimiter.validateRequest(stream, 1); err != nil {
+		logger.WithError(err).Error("Cannot validate request")
+		return err
+	}
+	s.rateLimiter.add(stream, 1)
+
+	r, ok := msg.(*eth.LightClientEpochDataByRangeRequest)
+	if !ok {
+		logger.Error("Message is not *eth.LightClientEpochDataByRangeRequest")
+		return fmt.Errorf("message is not type %T", &eth.LightClientEpochDataByRangeRequest{})
+	}
+
+	if r.Count == 0 {
+		s.writeErrorResponseToStream(responseCodeInvalidRequest, "count is 0", stream)
+		s.downscorePeer(remotePeer, "lightClientEpochDataByRangeRPCHandlerCount0")
+		logger.Error("Count is 0")
+		return nil
+	}
+	count := min(r.Count, params.BeaconConfig().MaxRequestLightClientEpochData)
+
+	data, err := s.lcStore.LightClientEpochDataByRange(ctx, r.LastEpoch, count, s.cfg.chain.FinalizedCheckpt().Epoch)
+	if err != nil {
+		s.writeErrorResponseToStream(responseCodeServerError, types.ErrGeneric.Error(), stream)
+		tracing.AnnotateError(span, err)
+		logger.WithError(err).Error("Cannot retrieve light client epoch data")
+		return err
+	}
+
+	if len(data) == 0 {
+		s.writeErrorResponseToStream(responseCodeResourceUnavailable, types.ErrResourceUnavailable.Error(), stream)
+		logger.Debugf("No epoch data available for last epoch %d", r.LastEpoch)
+		return nil
+	}
+
+	for _, d := range data {
+		SetStreamWriteDeadline(stream, defaultWriteDuration)
+		if err := WriteLightClientEpochDataChunk(stream, s.cfg.p2p.Encoding(), d); err != nil {
+			s.writeErrorResponseToStream(responseCodeServerError, types.ErrGeneric.Error(), stream)
+			tracing.AnnotateError(span, err)
+			logger.WithError(err).Error("WriteLightClientEpochDataChunk")
+			return err
+		}
+		s.rateLimiter.add(stream, 1)
+	}
+
+	closeStream(stream, logger)
+	return nil
+}
+
 // lightClientFinalityUpdateRPCHandler handles the /eth2/beacon_chain/req/light_client_finality_update/1/ RPC request.
 func (s *Service) lightClientFinalityUpdateRPCHandler(ctx context.Context, _ any, stream libp2pcore.Stream) error {
 	ctx, span := trace.StartSpan(ctx, "sync.lightClientFinalityUpdateRPCHandler")

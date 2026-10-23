@@ -91,6 +91,7 @@ func TestRPCHandlerByTopicFromFork_LightClient(t *testing.T) {
 		prysmP2P.RPCLightClientUpdatesByRangeTopicV1,
 		prysmP2P.RPCLightClientFinalityUpdateTopicV1,
 		prysmP2P.RPCLightClientOptimisticUpdateTopicV1,
+		prysmP2P.RPCLightClientEpochDataByRangeTopicV0,
 	}
 	s := &Service{}
 	for _, enabled := range []bool{false, true} {

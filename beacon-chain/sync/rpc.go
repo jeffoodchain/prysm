@@ -50,6 +50,7 @@ func (s *Service) rpcHandlerByTopicFromFork(forkIndex int) (map[string]rpcHandle
 		handler[p2p.RPCLightClientUpdatesByRangeTopicV1] = s.lightClientUpdatesByRangeRPCHandler
 		handler[p2p.RPCLightClientFinalityUpdateTopicV1] = s.lightClientFinalityUpdateRPCHandler
 		handler[p2p.RPCLightClientOptimisticUpdateTopicV1] = s.lightClientOptimisticUpdateRPCHandler
+		handler[p2p.RPCLightClientEpochDataByRangeTopicV0] = s.lightClientEpochDataByRangeRPCHandler
 	}
 
 	return handler, nil
