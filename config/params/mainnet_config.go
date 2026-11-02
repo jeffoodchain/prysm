@@ -292,8 +292,9 @@ var mainnetBeaconConfig = &BeaconChainConfig{
 	InactivityPenaltyQuotientBellatrix:      1 << 24,
 
 	// Light client
-	MinSyncCommitteeParticipants: 1,
-	MaxRequestLightClientUpdates: 128,
+	MinSyncCommitteeParticipants:   1,
+	MaxRequestLightClientUpdates:   128,
+	MaxRequestLightClientEpochData: 256,
 
 	// Bellatrix
 	TerminalBlockHashActivationEpoch: 18446744073709551615,

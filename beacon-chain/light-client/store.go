@@ -12,7 +12,9 @@ import (
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/state"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/interfaces"
+	light_client "github.com/OffchainLabs/prysm/v7/consensus-types/light-client"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
+	pb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	"github.com/OffchainLabs/prysm/v7/time/slots"
 	"github.com/pkg/errors"
 )
@@ -229,6 +231,104 @@ func (s *Store) LightClientUpdate(ctx context.Context, period uint64, headBlock 
 		return nil, nil
 	}
 	return updates[0], nil
+}
+
+// LightClientEpochDataByRange returns up to count entries from lastEpoch down, newest first.
+// It stops at the first epoch that is not stored or is after finalizedEpoch. An entry carries
+// the current sync committee when its checkpoint block is the last checkpoint of its period.
+func (s *Store) LightClientEpochDataByRange(ctx context.Context, lastEpoch primitives.Epoch, count uint64, finalizedEpoch primitives.Epoch) ([]light_client.EpochData, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	get := func(epoch primitives.Epoch) (light_client.EpochData, error) {
+		if epoch > finalizedEpoch {
+			return nil, nil
+		}
+		return s.beaconDB.LightClientEpochData(ctx, epoch)
+	}
+
+	var data []light_client.EpochData
+	for i := uint64(0); i < count && i <= uint64(lastEpoch); i++ {
+		d, err := get(lastEpoch - primitives.Epoch(i))
+		if err != nil {
+			return nil, err
+		}
+		if d == nil {
+			break
+		}
+		data = append(data, d)
+	}
+	if len(data) == 0 {
+		return nil, nil
+	}
+
+	// A checkpoint is the last one of its period when the next checkpoint is in a later period.
+	// nextPeriod is the next checkpoint's period. If none is stored yet, it is the period of the
+	// newest stored epoch, since any later checkpoint comes after that epoch's start slot.
+	nextPeriod := slots.SyncCommitteePeriod(lastEpoch)
+	lastPeriod := nextPeriod
+	for epoch := lastEpoch + 1; nextPeriod <= lastPeriod; epoch++ {
+		d, err := get(epoch)
+		if err != nil {
+			return nil, err
+		}
+		if d == nil {
+			break
+		}
+		slot, ok, err := light_client.EpochDataCheckpointSlot(d)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			nextPeriod = slots.SyncCommitteePeriod(slots.ToEpoch(slot))
+			break
+		}
+		nextPeriod = slots.SyncCommitteePeriod(epoch)
+	}
+
+	for _, d := range data {
+		slot, ok, err := light_client.EpochDataCheckpointSlot(d)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		period := slots.SyncCommitteePeriod(slots.ToEpoch(slot))
+		if nextPeriod > period {
+			committee, err := s.beaconDB.LightClientPeriodSyncCommittee(ctx, period)
+			if err != nil {
+				return nil, err
+			}
+			if committee == nil {
+				return nil, errors.Errorf("no sync committee stored for period %d", period)
+			}
+			if err := setEpochDataSyncCommittee(d, committee); err != nil {
+				return nil, err
+			}
+		}
+		nextPeriod = period
+	}
+	return data, nil
+}
+
+func setEpochDataSyncCommittee(d light_client.EpochData, committee *pb.SyncCommittee) error {
+	c := []*pb.SyncCommittee{committee}
+	switch t := d.(type) {
+	case *pb.LightClientEpochDataAltair:
+		t.BootstrapData.CurrentSyncCommittee = c
+	case *pb.LightClientEpochDataCapella:
+		t.BootstrapData.CurrentSyncCommittee = c
+	case *pb.LightClientEpochDataDeneb:
+		t.BootstrapData.CurrentSyncCommittee = c
+	case *pb.LightClientEpochDataElectra:
+		t.BootstrapData.CurrentSyncCommittee = c
+	case *pb.LightClientEpochDataGloas:
+		t.BootstrapData.CurrentSyncCommittee = c
+	default:
+		return errors.Errorf("unsupported light client epoch data type %T", d)
+	}
+	return nil
 }
 
 func (s *Store) getCacheUpdatesByPeriod(headBlock interfaces.ReadOnlySignedBeaconBlock) (map[uint64]interfaces.LightClientUpdate, error) {

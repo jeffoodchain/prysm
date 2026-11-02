@@ -170,3 +170,18 @@ message LightClientUpdatesByRangeRequest {
   uint64 start_period = 1;
   uint64 count = 2;
 }
+
+/*
+ Spec Definition:
+ (
+  last_epoch: Epoch
+  count: uint64
+ )
+*/
+message LightClientEpochDataByRangeRequest {
+  uint64 last_epoch = 1 [
+    (ethereum.eth.ext.cast_type) =
+        "github.com/OffchainLabs/prysm/v7/consensus-types/primitives.Epoch"
+  ];
+  uint64 count = 2;
+}

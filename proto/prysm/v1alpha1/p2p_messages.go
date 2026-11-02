@@ -29,6 +29,11 @@ func (c *ExecutionPayloadEnvelopesByRangeRequest) MaxSizeSSZ() int {
 	return c.SizeSSZ()
 }
 
+// MaxSizeSSZ returns the fixed SSZ size.
+func (c *LightClientEpochDataByRangeRequest) MaxSizeSSZ() int {
+	return c.SizeSSZ()
+}
+
 // MaxSizeSSZ includes the maximum number of column indices.
 func (c *DataColumnSidecarsByRangeRequest) MaxSizeSSZ() int {
 	fixedSize := (&DataColumnSidecarsByRangeRequest{}).SizeSSZ()

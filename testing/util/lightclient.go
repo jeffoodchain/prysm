@@ -1315,3 +1315,35 @@ func MockFinalityUpdate() (interfaces.LightClientFinalityUpdate, error) {
 	}
 	return lightclienttypes.NewWrappedFinalityUpdateAltair(pbUpdate)
 }
+
+// NewLightClientEpochDataAltair returns Altair epoch data whose only block is block_data[checkpoint].
+// A negative checkpoint gives block_data with no block.
+func NewLightClientEpochDataAltair(epoch primitives.Epoch, checkpoint int) *ethpb.LightClientEpochDataAltair {
+	zeroBranch := func(depth int) [][]byte {
+		branch := make([][]byte, depth)
+		for i := range branch {
+			branch[i] = make([]byte, fieldparams.RootLength)
+		}
+		return branch
+	}
+	blockData := make([]*ethpb.LightClientBlockData, fieldparams.SlotsPerEpoch)
+	for i := range blockData {
+		blockData[i] = &ethpb.LightClientBlockData{
+			StateRoot:                  make([]byte, fieldparams.RootLength),
+			SyncCommitteeBits:          make([]byte, fieldparams.SyncAggregateSyncCommitteeBytesLength),
+			SyncCommitteeSignatureRoot: make([]byte, fieldparams.RootLength),
+			SyncAggregateBranch:        zeroBranch(fieldparams.SyncAggregateBranchDepth),
+		}
+	}
+	if checkpoint >= 0 {
+		blockData[checkpoint].StateRoot[0] = 1
+	}
+	return &ethpb.LightClientEpochDataAltair{
+		Epoch:             epoch,
+		ParentBlockHeader: HydrateBeaconHeader(&ethpb.BeaconBlockHeader{}),
+		BlockData:         blockData,
+		BootstrapData:     &ethpb.LightClientBootstrapDataAltair{CurrentSyncCommitteeBranch: zeroBranch(fieldparams.SyncCommitteeBranchDepth)},
+		FinalizedRoot:     make([]byte, fieldparams.RootLength),
+		FinalityBranch:    zeroBranch(fieldparams.FinalityBranchDepth),
+	}
+}

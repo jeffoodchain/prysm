@@ -11,7 +11,9 @@ import (
 	prysmP2P "github.com/OffchainLabs/prysm/v7/beacon-chain/p2p"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/encoder"
 	p2ptest "github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/testing"
+	"github.com/OffchainLabs/prysm/v7/config/features"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
+	"github.com/OffchainLabs/prysm/v7/runtime/version"
 	"github.com/OffchainLabs/prysm/v7/testing/assert"
 	"github.com/OffchainLabs/prysm/v7/testing/require"
 	"github.com/OffchainLabs/prysm/v7/testing/util"
@@ -80,6 +82,29 @@ func TestRegisterRPC_ReceivesValidMessage(t *testing.T) {
 
 	if util.WaitTimeout(&wg, time.Second) {
 		t.Fatal("Did not receive RPC in 1 second")
+	}
+}
+
+func TestRPCHandlerByTopicFromFork_LightClient(t *testing.T) {
+	topics := []string{
+		prysmP2P.RPCLightClientBootstrapTopicV1,
+		prysmP2P.RPCLightClientUpdatesByRangeTopicV1,
+		prysmP2P.RPCLightClientFinalityUpdateTopicV1,
+		prysmP2P.RPCLightClientOptimisticUpdateTopicV1,
+		prysmP2P.RPCLightClientEpochDataByRangeTopicV0,
+	}
+	s := &Service{}
+	for _, enabled := range []bool{false, true} {
+		reset := features.InitWithReset(&features.Flags{EnableLightClient: enabled})
+		for _, v := range version.All() {
+			handler, err := s.rpcHandlerByTopicFromFork(v)
+			require.NoError(t, err)
+			for _, topic := range topics {
+				_, ok := handler[topic]
+				require.Equal(t, enabled && v >= version.Altair, ok, "%s at %s", topic, version.String(v))
+			}
+		}
+		reset()
 	}
 }
 

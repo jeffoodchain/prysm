@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"io"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,11 +13,15 @@ import (
 	lightClient "github.com/OffchainLabs/prysm/v7/beacon-chain/light-client"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p"
 	p2ptest "github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/testing"
+	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/types"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/startup"
 	mockSync "github.com/OffchainLabs/prysm/v7/beacon-chain/sync/initial-sync/testing"
 	"github.com/OffchainLabs/prysm/v7/config/features"
+	fieldparams "github.com/OffchainLabs/prysm/v7/config/fieldparams"
 	"github.com/OffchainLabs/prysm/v7/config/params"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
+	light_client "github.com/OffchainLabs/prysm/v7/consensus-types/light-client"
+	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
 	leakybucket "github.com/OffchainLabs/prysm/v7/container/leaky-bucket"
 	pb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	"github.com/OffchainLabs/prysm/v7/runtime/version"
@@ -511,4 +516,77 @@ func TestRPC_LightClientUpdatesByRange(t *testing.T) {
 		})
 	}
 
+}
+
+func TestRPC_LightClientEpochDataByRange(t *testing.T) {
+	params.SetupTestConfigCleanup(t)
+	cfg := params.MainnetConfig().Copy()
+	cfg.AltairForkEpoch = 0
+	cfg.BellatrixForkEpoch = 2
+	cfg.MaxRequestLightClientEpochData = 2
+	params.OverrideBeaconConfig(cfg)
+	params.BeaconConfig().InitializeForkSchedule()
+
+	ctx := t.Context()
+	server := p2ptest.NewTestP2P(t)
+	client := p2ptest.NewTestP2P(t)
+	client.Connect(server)
+	d := db.SetupDB(t)
+	r := &Service{
+		ctx: ctx,
+		cfg: &config{
+			p2p:      server,
+			beaconDB: d,
+			chain:    &mockChain.ChainService{FinalizedCheckPoint: &pb.Checkpoint{Epoch: 3}},
+		},
+		lcStore:     lightClient.NewLightClientStore(&p2ptest.FakeP2P{}, new(event.Feed), d),
+		rateLimiter: newRateLimiter(server),
+	}
+	r.registerRPC(p2p.RPCLightClientEpochDataByRangeTopicV0, r.lightClientEpochDataByRangeRPCHandler)
+
+	// Epoch 2 is the Bellatrix fork epoch, but its checkpoint block is in epoch 1.
+	// Epoch 4 is stored but not finalized.
+	data := map[primitives.Epoch]*pb.LightClientEpochDataAltair{
+		1: util.NewLightClientEpochDataAltair(1, fieldparams.SlotsPerEpoch-1),
+		2: util.NewLightClientEpochDataAltair(2, fieldparams.SlotsPerEpoch-2),
+		3: util.NewLightClientEpochDataAltair(3, fieldparams.SlotsPerEpoch-1),
+		4: util.NewLightClientEpochDataAltair(4, fieldparams.SlotsPerEpoch-1),
+	}
+	require.NoError(t, d.SaveLightClientEpochData(ctx, []light_client.EpochData{data[1], data[2], data[3], data[4]}))
+
+	request := func(t *testing.T, req *pb.LightClientEpochDataByRangeRequest) network.Stream {
+		pid := protocol.ID(p2p.RPCLightClientEpochDataByRangeTopicV0 + server.Encoding().ProtocolSuffix())
+		stream, err := client.BHost.NewStream(ctx, server.BHost.ID(), pid)
+		require.NoError(t, err)
+		_, err = client.Encoding().EncodeWithMaxLength(stream, req)
+		require.NoError(t, err)
+		require.NoError(t, stream.CloseWrite())
+		return stream
+	}
+
+	t.Run("newest first, capped, context from the checkpoint block", func(t *testing.T) {
+		stream := request(t, &pb.LightClientEpochDataByRangeRequest{LastEpoch: 3, Count: 10})
+		for _, want := range []struct{ epoch, forkEpoch primitives.Epoch }{{3, 3}, {2, 1}} {
+			expectSuccess(t, stream)
+			rpcCtx, err := readContextFromStream(stream)
+			require.NoError(t, err)
+			digest := params.ForkDigest(want.forkEpoch)
+			require.DeepEqual(t, digest[:], rpcCtx)
+			got := &pb.LightClientEpochDataAltair{}
+			require.NoError(t, client.Encoding().DecodeWithMaxLength(stream, got))
+			require.DeepEqual(t, data[want.epoch], got)
+		}
+		_, _, err := ReadStatusCode(stream, client.Encoding())
+		require.ErrorIs(t, err, io.EOF)
+	})
+
+	t.Run("count is 0", func(t *testing.T) {
+		stream := request(t, &pb.LightClientEpochDataByRangeRequest{LastEpoch: 3})
+		expectFailure(t, responseCodeInvalidRequest, "count is 0", stream)
+	})
+
+	t.Run("last epoch is not finalized", func(t *testing.T) {
+		stream := request(t, &pb.LightClientEpochDataByRangeRequest{LastEpoch: 4, Count: 1})
+		expectFailure(t, responseCodeResourceUnavailable, types.ErrResourceUnavailable.Error(), stream)
+	})
 }
